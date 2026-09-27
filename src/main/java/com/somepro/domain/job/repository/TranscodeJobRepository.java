@@ -37,6 +37,17 @@ public interface TranscodeJobRepository {
     Mono<TranscodeJob> cancelIfPending(TranscodeJob job);
 
     /**
+     * 重排（重试）落库（乐观条件更新，一个事务里两件事）：
+     * ① 仅当库里仍是 FAILED 才把任务改回 PENDING，并清掉失败说明、进度归零、起止时刻清空
+     *    （attempt_count 不动，下次领取时接着往下排，不在这里新增执行记录）——
+     *    同一条任务被连点几下、或几个人同时点，InnoDB 行锁把请求串行，只有第一个 UPDATE
+     *    rows=1，其余 rows=0，保证只排一次、不重复入队；PENDING/RUNNING/SUCCESS/CANCELLED
+     *    同样在这里被挡回；
+     * ② 对应素材跟着退回可转码（READY），等任务再次被领走时再进转码中。
+     */
+    Mono<TranscodeJob> requeueIfFailed(TranscodeJob job);
+
+    /**
      * 领取落库（乐观条件更新，一个事务里三件事）：
      * ① 仅当库里仍是 PENDING 才把任务改成 RUNNING —— 几个节点同时抢也只放一台，
      *    其余 rows=0 给明确提示；已被领走的、已出结果的同样在这里被挡回；

@@ -174,6 +174,91 @@ class TranscodeJobAppServiceTest {
         verify(jobRepository).cancelIfPending(any());
     }
 
+    @Test
+    void retryShouldFailWhenJobMissing() {
+        when(jobRepository.findById(9L)).thenReturn(Mono.empty());
+
+        assertThrows(BizException.class, () -> service.retry(9L).block());
+        verify(jobRepository, never()).requeueIfFailed(any());
+    }
+
+    @Test
+    void retryShouldFailWhenNotFailed() {
+        // 还在排队等领的、正在跑的、已经成功的、被撤掉的，都不该能重试
+        for (JobStatus status : new JobStatus[]{
+                JobStatus.PENDING, JobStatus.RUNNING, JobStatus.SUCCESS, JobStatus.CANCELLED}) {
+            TranscodeJob job = pendingJob();
+            job.setStatus(status);
+            when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+
+            assertThrows(BizException.class, () -> service.retry(9L).block());
+        }
+        verify(assetRepository, never()).findById(any());
+        verify(profileRepository, never()).findById(any());
+        verify(jobRepository, never()).requeueIfFailed(any());
+    }
+
+    @Test
+    void retryShouldFailWhenAttemptLimitReached() {
+        // 到顶的单子给明确的话，不放进队列（连素材档位都不必再看）
+        TranscodeJob job = failedJob(3);
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+
+        BizException e = assertThrows(BizException.class, () -> service.retry(9L).block());
+        assertEquals("任务已达到最大尝试次数（已尝试 3 次，上限 3 次），不能再重试", e.getMessage());
+        verify(assetRepository, never()).findById(any());
+        verify(jobRepository, never()).requeueIfFailed(any());
+    }
+
+    @Test
+    void retryShouldFailWhenAssetMissingOrDisabled() {
+        // 素材已经删了（查不到）或被停用，都不能重排
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(failedJob()));
+        when(assetRepository.findById(1L)).thenReturn(Mono.empty());
+        assertThrows(BizException.class, () -> service.retry(9L).block());
+
+        MediaAsset disabled = readyAsset();
+        disabled.setStatus(AssetStatus.DISABLED);
+        when(assetRepository.findById(1L)).thenReturn(Mono.just(disabled));
+        assertThrows(BizException.class, () -> service.retry(9L).block());
+
+        verify(profileRepository, never()).findById(any());
+        verify(jobRepository, never()).requeueIfFailed(any());
+    }
+
+    @Test
+    void retryShouldFailWhenProfileMissingOrDisabled() {
+        // 档位已经删了（查不到）或被停用，都不能重排
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(failedJob()));
+        when(assetRepository.findById(1L)).thenReturn(Mono.just(readyAsset()));
+        when(profileRepository.findById(2L)).thenReturn(Mono.empty());
+        assertThrows(BizException.class, () -> service.retry(9L).block());
+
+        TranscodeProfile disabled = enabledProfile();
+        disabled.setStatus(ProfileStatus.DISABLED);
+        when(profileRepository.findById(2L)).thenReturn(Mono.just(disabled));
+        assertThrows(BizException.class, () -> service.retry(9L).block());
+
+        verify(jobRepository, never()).requeueIfFailed(any());
+    }
+
+    @Test
+    void retryShouldPersistPendingJobWithoutNewAttempt() {
+        TranscodeJob job = failedJob();
+        when(jobRepository.findById(9L)).thenReturn(Mono.just(job));
+        stubAssetAndProfile(readyAsset(), enabledProfile());
+        when(jobRepository.requeueIfFailed(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        TranscodeJob retried = service.retry(9L).block();
+
+        assertEquals(JobStatus.PENDING, retried.getStatus());
+        assertEquals(0, retried.getProgress());
+        assertEquals(1, retried.getAttemptCount());
+        verify(jobRepository).requeueIfFailed(any());
+        // 重试只是放回队列：不在这里新增执行记录，等真被领走才接着记
+        verify(jobRepository, never()).claimIfPending(any(), any());
+    }
+
     private TranscodeJob pendingJob() {
         TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
         job.setId(9L);
@@ -184,6 +269,24 @@ class TranscodeJobAppServiceTest {
     private TranscodeJob runningJob() {
         TranscodeJob job = pendingJob();
         job.claim();
+        return job;
+    }
+
+    /** 造一条跑过一次后失败的 FAILED 任务（attemptCount=1，未到缺省上限 3，可重试）。 */
+    private TranscodeJob failedJob() {
+        return failedJob(1);
+    }
+
+    /** 造一条已经跑过 attemptCount 次、当前 FAILED 的任务（中间按流程重试回队）。 */
+    private TranscodeJob failedJob(int attemptCount) {
+        TranscodeJob job = pendingJob();
+        for (int i = 0; i < attemptCount; i++) {
+            if (i > 0) {
+                job.retry();
+            }
+            job.claim();
+            job.fail("转码器崩溃", null);
+        }
         return job;
     }
 

@@ -18,7 +18,10 @@ import java.time.LocalDateTime;
  *   submittedAt 记提交时刻；
  * - 只有 PENDING 能被节点领取（claim），领取后 RUNNING、记开始时刻、已尝试次数 +1；
  * - 只有 RUNNING 能报进度、出结果；进度是 0-100 的整数且只能往前；
- * - SUCCESS / FAILED / CANCELLED 都是终态：出了结果的任务不再接受任何上报，也不会再被领取；
+ * - SUCCESS / CANCELLED 是终态：出了结果的任务不再接受任何上报，也不会再被领取；
+ * - FAILED 在已尝试次数未到上限（maxAttempts，提交时定死）时，可由有权限的人重排（retry）
+ *   回 PENDING 重新排队：清掉失败说明、进度归零、起止时刻清空，attemptCount 原样保留，
+ *   不新增执行记录（下次被领取时 attemptNo 接着上一次往下排）；到了上限的 FAILED 不能再重排；
  * - 撤销只能发生在 PENDING（还没被节点领走），且必须写明撤销原因；
  *   表里没有单独的取消原因列，原因落在 errorMsg；
  * - 任务编号 jobNo 形如 TJ-2026-0001，由仓储按年顺序分配（应用层不给编号）。
@@ -197,6 +200,35 @@ public class TranscodeJob extends BaseEntity {
         this.status = JobStatus.CANCELLED;
         this.errorMsg = reason.trim();
         this.finishedAt = LocalDateTime.now();
+    }
+
+    /**
+     * 领域行为：重排（重试）一条失败的任务，把它放回待处理队列。
+     *
+     * - 只有 FAILED 能重排：还在排队等领的（PENDING）、正在跑的（RUNNING）、
+     *   已成功的（SUCCESS）、已撤销的（CANCELLED）都不允许；
+     * - 最多能跑几次在建任务时就定死了（maxAttempts）：已尝试次数到了上限的，
+     *   给明确提示、不放进队列，免得到顶的单子没完没了占位置；
+     * - 干干净净重新排队：上回留下的失败说明清掉、进度归零、起止时刻清空，
+     *   已跑过的次数（attemptCount）原样保留 —— 下次被节点领走时 attemptNo 接着往下排。
+     *
+     * 注意：这里只校验「当前看到的状态」；同一条任务被连点几下、或几个人同时点，
+     * 仓储落库时还要带 status=FAILED 的条件再兜一道（乐观条件更新，见 requeueIfFailed），
+     * 保证只排一次、不重复入队。素材/档位是否还能用由应用层在重排前校验。
+     */
+    public void retry() {
+        if (status != JobStatus.FAILED) {
+            throw new BizException("只有失败（FAILED）的任务才能重试，当前状态：" + status);
+        }
+        if (attemptCount >= maxAttempts) {
+            throw new BizException("任务已达到最大尝试次数（已尝试 " + attemptCount
+                    + " 次，上限 " + maxAttempts + " 次），不能再重试");
+        }
+        this.status = JobStatus.PENDING;
+        this.progress = 0;
+        this.errorMsg = null;
+        this.startedAt = null;
+        this.finishedAt = null;
     }
 
     /** 聚合不变量：提交时要过这道校验。 */

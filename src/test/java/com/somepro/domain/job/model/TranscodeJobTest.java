@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
@@ -151,6 +152,59 @@ class TranscodeJobTest {
     }
 
     @Test
+    void retryShouldOnlyAllowFailed() {
+        // 还在排队等领的、正在跑的、已成功的、被撤掉的，都不该能重试
+        for (JobStatus status : new JobStatus[]{
+                JobStatus.PENDING, JobStatus.RUNNING, JobStatus.SUCCESS, JobStatus.CANCELLED}) {
+            TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
+            job.setStatus(status);
+
+            BizException e = assertThrows(BizException.class, job::retry);
+            assertEquals("只有失败（FAILED）的任务才能重试，当前状态：" + status, e.getMessage());
+        }
+    }
+
+    @Test
+    void retryShouldRejectWhenAttemptLimitReached() {
+        // 能重排几次建任务时就定死（maxAttempts），到了上限给明确话、不再放回队列
+        TranscodeJob job = failedJob(3);
+        job.setMaxAttempts(3);
+
+        BizException e = assertThrows(BizException.class, job::retry);
+        assertEquals("任务已达到最大尝试次数（已尝试 3 次，上限 3 次），不能再重试", e.getMessage());
+        assertEquals(JobStatus.FAILED, job.getStatus());
+    }
+
+    @Test
+    void retryShouldCleanFieldsButKeepAttemptCount() {
+        // 失败说明清掉、进度归零、起止时刻清空，已跑过的次数留着不动，干干净净回 PENDING
+        TranscodeJob job = failedJob(2);
+        assertEquals(80, job.getProgress());
+
+        job.retry();
+
+        assertEquals(JobStatus.PENDING, job.getStatus());
+        assertEquals(0, job.getProgress());
+        assertNull(job.getErrorMsg());
+        assertNull(job.getStartedAt());
+        assertNull(job.getFinishedAt());
+        assertEquals(2, job.getAttemptCount());
+        assertEquals(TranscodeJob.DEFAULT_MAX_ATTEMPTS, job.getMaxAttempts());
+    }
+
+    @Test
+    void retryThenClaimShouldContinueAttemptNumber() {
+        // 重试只是放回队列、不新增执行记录；再次被领走时执行序号接着上一次往下排
+        TranscodeJob job = failedJob(2);
+
+        job.retry();
+        job.claim();
+
+        assertEquals(JobStatus.RUNNING, job.getStatus());
+        assertEquals(3, job.getAttemptCount());
+    }
+
+    @Test
     void finishShouldRejectWhenNotRunning() {
         // 没被领走的任务不能出结果
         TranscodeJob pending = TranscodeJob.submit(1L, 2L, "技术部", 1);
@@ -172,6 +226,20 @@ class TranscodeJobTest {
     private static TranscodeJob claimedJob() {
         TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
         job.claim();
+        return job;
+    }
+
+    /** 造一条已经跑过 attemptCount 次、当前 FAILED 的任务（每次报 80% 后失败，中间按流程重试回队）。 */
+    private static TranscodeJob failedJob(int attemptCount) {
+        TranscodeJob job = TranscodeJob.submit(1L, 2L, "技术部", 1);
+        for (int i = 0; i < attemptCount; i++) {
+            if (i > 0) {
+                job.retry();
+            }
+            job.claim();
+            job.reportProgress(80);
+            job.fail("转码器崩溃", null);
+        }
         return job;
     }
 }

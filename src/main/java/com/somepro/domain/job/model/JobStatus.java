@@ -7,7 +7,8 @@ import com.somepro.common.exception.BizException;
  * PENDING 待处理 / RUNNING 处理中 / SUCCESS 成功 / FAILED 失败 / CANCELLED 已取消。
  *
  * 新提交的任务一律 PENDING（见 TranscodeJob.submit），后续状态由节点领取、执行流程推进；
- * 只有 PENDING 还允许撤销。
+ * 只有 PENDING 还允许撤销。FAILED 在尝试次数未到上限时可重排回 PENDING（见 TranscodeJob.retry），
+ * 到了上限的 FAILED 与 SUCCESS / CANCELLED 一样都是不再流转的终态。
  */
 public enum JobStatus {
 

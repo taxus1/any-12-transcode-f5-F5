@@ -20,7 +20,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 /**
- * 转码任务接口（用户接口层）：提交 / 撤销 / 节点领取 / 上报进度 / 上报结果 / 执行记录 / 查看 / 分页。
+ * 转码任务接口（用户接口层）：提交 / 撤销 / 重试 / 节点领取 / 上报进度 / 上报结果 / 执行记录 / 查看 / 分页。
  *
  * 只做协议适配（参数解析、VO 转换、返回包装），业务编排交给应用层：
  * - 统一返回 Mono<Result<T>>；
@@ -54,6 +54,18 @@ public class TranscodeJobController {
     public Mono<Result<TranscodeJobVO>> cancel(@PathVariable Long id,
                                                @RequestParam(required = false) String reason) {
         return transcodeJobAppService.cancel(id, reason)
+                .map(TranscodeJobVoConverter::toVo)
+                .map(Result::ok);
+    }
+
+    /**
+     * 重试（重排）失败任务：FAILED → PENDING，重新排回队列等节点再领，素材跟着退回可转码。
+     * 只有失败的任务能重试；到了建任务时定死的尝试上限、素材/档位被停用或删除，都给明确提示；
+     * 连点或多人同时点只排一次，不新增执行记录，下次跑起来执行序号接着上一次往下排。
+     */
+    @PostMapping("/{id}/retry")
+    public Mono<Result<TranscodeJobVO>> retry(@PathVariable Long id) {
+        return transcodeJobAppService.retry(id)
                 .map(TranscodeJobVoConverter::toVo)
                 .map(Result::ok);
     }
