@@ -20,7 +20,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 /**
- * 转码任务接口（用户接口层）：提交 / 撤销 / 节点领取 / 上报进度 / 上报结果 / 执行记录 / 查看 / 分页。
+ * 转码任务接口（用户接口层）：提交 / 撤销 / 节点领取 / 上报进度 / 上报结果 / 失败重试 / 执行记录 / 查看 / 分页。
  *
  * 只做协议适配（参数解析、VO 转换、返回包装），业务编排交给应用层：
  * - 统一返回 Mono<Result<T>>；
@@ -101,6 +101,17 @@ public class TranscodeJobController {
     public Mono<Result<List<JobAttemptVO>>> listAttempts(@PathVariable Long id) {
         return transcodeJobAppService.listAttempts(id)
                 .map(list -> list.stream().map(JobAttemptVoConverter::toVo).toList())
+                .map(Result::ok);
+    }
+
+    /**
+     * 重试失败任务：只有 FAILED 能重试，到尝试上限的给明确提示、不放进队列；
+     * 重试只重新排队（回 PENDING、清失败说明/进度/起止时刻，已跑次数不动），不新增执行记录。
+     */
+    @PostMapping("/{id}/retry")
+    public Mono<Result<TranscodeJobVO>> retry(@PathVariable Long id) {
+        return transcodeJobAppService.retry(id)
+                .map(TranscodeJobVoConverter::toVo)
                 .map(Result::ok);
     }
 

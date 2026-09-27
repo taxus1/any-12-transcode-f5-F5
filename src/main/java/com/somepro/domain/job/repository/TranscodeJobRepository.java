@@ -60,6 +60,17 @@ public interface TranscodeJobRepository {
      */
     Mono<TranscodeJob> finishIfRunning(TranscodeJob job);
 
+    /**
+     * 失败重试落库（乐观条件更新，一个事务里三件事）：
+     * ① 锁内复查素材仍存在且未停用、档位仍存在且未停用 —— 重试前料与规格被停用/删除的一律挡住；
+     * ② 仅当库里仍是 FAILED 才把任务改回 PENDING（清失败说明、进度归零、起止时刻清空，
+     *    attempt_count 不动）—— 同一条任务连点几下、几个人同时点，InnoDB 行锁串行后
+     *    只有一次 rows=1，其余 rows=0，只排一次，不会重复入队；
+     * ③ 素材跟着回到可领状态（READY）；等下次被节点领走再进转码中（见 claimIfPending）。
+     * 本步不新增执行记录：下次领走时才接着上一次的 attemptNo 往下记。
+     */
+    Mono<TranscodeJob> requeueIfFailed(TranscodeJob job);
+
     /** 某任务的执行记录（第几次跑、哪台节点、起止时刻），按 attemptNo 升序。 */
     Mono<List<JobAttempt>> listAttempts(Long jobId);
 }

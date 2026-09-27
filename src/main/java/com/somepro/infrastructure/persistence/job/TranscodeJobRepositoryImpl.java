@@ -12,6 +12,7 @@ import com.somepro.domain.job.model.JobStatus;
 import com.somepro.domain.job.model.TranscodeJob;
 import com.somepro.domain.job.repository.TranscodeJobRepository;
 import com.somepro.domain.media.model.AssetStatus;
+import com.somepro.domain.profile.model.ProfileStatus;
 import com.somepro.domain.shared.model.PageResult;
 import com.somepro.infrastructure.config.ReactiveOperatorContext;
 import com.somepro.infrastructure.persistence.audit.AuditContextHolder;
@@ -21,6 +22,8 @@ import com.somepro.infrastructure.persistence.job.po.JobAttemptPO;
 import com.somepro.infrastructure.persistence.job.po.TranscodeJobPO;
 import com.somepro.infrastructure.persistence.media.MediaAssetMapper;
 import com.somepro.infrastructure.persistence.media.po.MediaAssetPO;
+import com.somepro.infrastructure.persistence.profile.TranscodeProfileMapper;
+import com.somepro.infrastructure.persistence.profile.po.TranscodeProfilePO;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -46,10 +49,11 @@ import java.util.stream.Collectors;
  * 1. 提交时事务内 SELECT ... FOR UPDATE 锁住素材行，锁内复查「同素材同档位无未完成任务」，
  *    同一素材的并发提交因此串行，不会重复落库；
  * 2. 任务编号 uk_job_no 唯一索引兜底，撞号（不同素材并发取到同一序号）时重取编号重试；
- * 3. 领取 / 进度 / 结果都走「乐观条件更新」（UPDATE ... WHERE status=期望值）：
+ * 3. 领取 / 进度 / 结果 / 重试都走「乐观条件更新」（UPDATE ... WHERE status=期望值）：
  *    InnoDB 行锁把并发请求串行，UPDATE 按当前读评估 WHERE，同一时刻只有一个请求能改成功，
  *    其余 rows=0，重读当前状态后给明确提示 —— 几个节点一起抢也只放一台；
- *    任务到了终态后，后续上报全部 rows=0，不会被重新改一遍，执行记录也不会再多出来。
+ *    任务到了终态后，后续上报全部 rows=0，不会被重新改一遍，执行记录也不会再多出来；
+ *    失败重试同理（WHERE status=FAILED），一条任务被连点/多人同时点也只重排一次。
  */
 @Repository
 public class TranscodeJobRepositoryImpl implements TranscodeJobRepository {
@@ -61,15 +65,18 @@ public class TranscodeJobRepositoryImpl implements TranscodeJobRepository {
 
     private final TranscodeJobMapper transcodeJobMapper;
     private final MediaAssetMapper mediaAssetMapper;
+    private final TranscodeProfileMapper transcodeProfileMapper;
     private final JobAttemptMapper jobAttemptMapper;
     private final TransactionTemplate transactionTemplate;
 
     public TranscodeJobRepositoryImpl(TranscodeJobMapper transcodeJobMapper,
                                       MediaAssetMapper mediaAssetMapper,
+                                      TranscodeProfileMapper transcodeProfileMapper,
                                       JobAttemptMapper jobAttemptMapper,
                                       PlatformTransactionManager transactionManager) {
         this.transcodeJobMapper = transcodeJobMapper;
         this.mediaAssetMapper = mediaAssetMapper;
+        this.transcodeProfileMapper = transcodeProfileMapper;
         this.jobAttemptMapper = jobAttemptMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
@@ -247,6 +254,59 @@ public class TranscodeJobRepositoryImpl implements TranscodeJobRepository {
     }
 
     @Override
+    public Mono<TranscodeJob> requeueIfFailed(TranscodeJob job) {
+        return blocking(() -> transactionTemplate.execute(status -> {
+            // ① 先抢任务行：仅当库里仍是 FAILED 才改回 PENDING。
+            //    同一条任务连点几下、几个人同时点时，InnoDB 行锁把更新串行，
+            //    第一个请求改成功，后续请求再按当前读重评 WHERE 都 rows=0 —— 只排一次。
+            //    先锁 job 再碰素材（与 claimIfPending / finishIfRunning 同序），
+            //    避免「重试持素材锁等任务锁、领取持任务锁等素材锁」的锁顺序倒置死锁。
+            //    error_msg / started_at / finished_at 要清成 NULL，必须走 wrapper.set(...)
+            //    （update(entity, wrapper) 只搬实体里的非空字段，set 不进 NULL）。
+            int rows = transcodeJobMapper.update(new TranscodeJobPO(),
+                    Wrappers.<TranscodeJobPO>lambdaUpdate()
+                            .set(TranscodeJobPO::getStatus, JobStatus.PENDING.name())
+                            .set(TranscodeJobPO::getProgress, 0)
+                            .set(TranscodeJobPO::getErrorMsg, null)
+                            .set(TranscodeJobPO::getStartedAt, null)
+                            .set(TranscodeJobPO::getFinishedAt, null)
+                            .eq(TranscodeJobPO::getId, job.getId())
+                            .eq(TranscodeJobPO::getStatus, JobStatus.FAILED.name()));
+            if (rows == 0) {
+                throw new BizException(requeueConflictMessage(job.getId()));
+            }
+            // ② 锁内复查素材与档位：停用 / 删除（@TableLogic 下查不到）的一律抛异常，
+            //    事务回滚，任务退回 FAILED —— 得先把料和规格拾掇好再来。
+            //    FOR UPDATE 挡住「复查通过 → 紧接着被停用/删除 → 照样入队」的并发窗口。
+            MediaAssetPO asset = mediaAssetMapper.selectOne(Wrappers.<MediaAssetPO>lambdaQuery()
+                    .eq(MediaAssetPO::getId, job.getAssetId())
+                    .last("FOR UPDATE"));
+            if (asset == null) {
+                throw new BizException("素材已删除，不能重试，请先恢复或更换素材：" + job.getAssetId());
+            }
+            if (AssetStatus.DISABLED.name().equals(asset.getStatus())) {
+                throw new BizException("素材已停用，不能重试，请先启用素材：" + job.getAssetId());
+            }
+            TranscodeProfilePO profile = transcodeProfileMapper.selectOne(
+                    Wrappers.<TranscodeProfilePO>lambdaQuery()
+                            .eq(TranscodeProfilePO::getId, job.getProfileId())
+                            .last("FOR UPDATE"));
+            if (profile == null) {
+                throw new BizException("转码档位已删除，不能重试，请先恢复或更换档位：" + job.getProfileId());
+            }
+            if (ProfileStatus.DISABLED.name().equals(profile.getStatus())) {
+                throw new BizException("转码档位已停用，不能重试，请先启用档位：" + job.getProfileId());
+            }
+            // ③ 素材跟着回到可领状态；等下次被节点领走再进转码中。
+            //    本步不碰执行记录：下次领走时才接着上一次的 attemptNo 往下记。
+            mediaAssetMapper.update(new MediaAssetPO(), Wrappers.<MediaAssetPO>lambdaUpdate()
+                    .set(MediaAssetPO::getStatus, AssetStatus.READY.name())
+                    .eq(MediaAssetPO::getId, job.getAssetId()));
+            return TranscodeJobPoConverter.toDomain(transcodeJobMapper.selectById(job.getId()));
+        }));
+    }
+
+    @Override
     public Mono<List<JobAttempt>> listAttempts(Long jobId) {
         return blocking(() -> jobAttemptMapper.selectList(Wrappers.<JobAttemptPO>lambdaQuery()
                         .eq(JobAttemptPO::getJobId, jobId)
@@ -257,13 +317,22 @@ public class TranscodeJobRepositoryImpl implements TranscodeJobRepository {
     }
 
     /** 条件更新 rows=0 时的明确提示：重读当前状态，告诉调用方任务现在到底什么样。 */
-    private String conflictMessage(Long jobId, String action) {
-        TranscodeJobPO current = transcodeJobMapper.selectById(jobId);
+    private String conflictMessage(Long jobId, String action) {        TranscodeJobPO current = transcodeJobMapper.selectById(jobId);
         if (current == null) {
             return "转码任务不存在：" + jobId;
         }
         return action + "失败，任务当前状态：" + current.getStatus()
                 + "（可能已被其他节点领取或已出结果）";
+    }
+
+    /** 重试 rows=0 时的明确提示：重读当前状态，告诉调用方任务现在到底什么样（已不是失败态）。 */
+    private String requeueConflictMessage(Long jobId) {
+        TranscodeJobPO current = transcodeJobMapper.selectById(jobId);
+        if (current == null) {
+            return "转码任务不存在：" + jobId;
+        }
+        return "重试失败，任务当前状态：" + current.getStatus()
+                + "（可能已被其他人重试并重新排队，请勿重复操作）";
     }
 
     /** 进度 rows=0 时的明确提示：区分「状态不对」与「进度回退」两种原因。 */

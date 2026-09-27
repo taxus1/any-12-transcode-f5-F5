@@ -19,12 +19,13 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 /**
- * 转码任务用例编排（应用层）：提交 / 撤销 / 节点领取 / 上报进度 / 上报结果 / 查看 / 分页。
+ * 转码任务用例编排（应用层）：提交 / 撤销 / 节点领取 / 上报进度 / 上报结果 / 失败重试 / 查看 / 分页。
  *
  * 不写业务规则（规则在领域层 TranscodeJob），只做编排：
  * - 提交前校验素材与档位状态、归属部门一致性、类型匹配、无同档位未完成任务；
+ * - 重试前校验素材与档位仍在且未停用，失败态与尝试上限由领域层把关；
  * - 并发重复提交与任务编号分配由仓储在事务里兜底（见 TranscodeJobRepository.submitNew）；
- * - 领取 / 进度 / 结果的并发互斥由仓储的条件更新兜底（见 TranscodeJobRepository 各 *If* 方法）；
+ * - 领取 / 进度 / 结果 / 重试的并发互斥由仓储的条件更新兜底（见 TranscodeJobRepository 各 *If* 方法）；
  * - 出入参都是领域对象，不认识 PO、也不认识 VO。
  */
 @Service
@@ -132,6 +133,35 @@ public class TranscodeJobAppService {
                 .flatMap(job -> transcodeJobRepository.listAttempts(id));
     }
 
+    /**
+     * 重试失败任务：FAILED → PENDING，干干净净重新排队。
+     *
+     * 编排顺序：任务存在 → 领域校验「只有 FAILED 且没到尝试上限」→ 素材仍在（未删除）且未停用
+     * → 档位仍在（未删除）且未启用 → 落库重排（仓储事务内再复查一遍 + WHERE status=FAILED 兜底，
+     * 连点/多人同点只排一次）。重试只重新排队：不新增执行记录，等节点再次领走时执行序号接着排。
+     */
+    public Mono<TranscodeJob> retry(Long id) {
+        return transcodeJobRepository.findById(id)
+                .switchIfEmpty(Mono.error(new BizException("转码任务不存在：" + id)))
+                .flatMap(job -> {
+                    // 非失败态、已到尝试上限：领域层直接挡回，不放进队列
+                    job.retry();
+                    return mediaAssetRepository.findById(job.getAssetId())
+                            .switchIfEmpty(Mono.error(new BizException(
+                                    "素材已删除，不能重试，请先恢复或更换素材：" + job.getAssetId())))
+                            .flatMap(asset -> {
+                                requireAssetRetryable(asset);
+                                return transcodeProfileRepository.findById(job.getProfileId())
+                                        .switchIfEmpty(Mono.error(new BizException(
+                                                "转码档位已删除，不能重试，请先恢复或更换档位：" + job.getProfileId())))
+                                        .flatMap(profile -> {
+                                            requireProfileRetryable(profile);
+                                            return transcodeJobRepository.requeueIfFailed(job);
+                                        });
+                            });
+                });
+    }
+
     /** 结果参数只认 SUCCESS / FAILED（大小写不敏感），其余值直接挡回。 */
     private static boolean isSuccess(String result) {
         if (result == null || result.isBlank()) {
@@ -180,6 +210,20 @@ public class TranscodeJobAppService {
         if (!profile.getMediaType().name().equals(asset.getMediaType().name())) {
             throw new BizException("档位适用类型（" + profile.getMediaType()
                     + "）与素材类型（" + asset.getMediaType() + "）不匹配");
+        }
+    }
+
+    /** 重试前的素材校验：已删除由仓储查不到处理；这里只挡停用（得先把料拾掇好）。 */
+    private static void requireAssetRetryable(MediaAsset asset) {
+        if (asset.getStatus() == AssetStatus.DISABLED) {
+            throw new BizException("素材已停用，不能重试，请先启用素材：" + asset.getId());
+        }
+    }
+
+    /** 重试前的档位校验：已删除由仓储查不到处理；这里只挡停用（得先把规格拾掇好）。 */
+    private static void requireProfileRetryable(TranscodeProfile profile) {
+        if (profile.getStatus() != ProfileStatus.ENABLED) {
+            throw new BizException("转码档位已停用，不能重试，请先启用档位：" + profile.getId());
         }
     }
 

@@ -21,6 +21,8 @@ import java.time.LocalDateTime;
  * - SUCCESS / FAILED / CANCELLED 都是终态：出了结果的任务不再接受任何上报，也不会再被领取；
  * - 撤销只能发生在 PENDING（还没被节点领走），且必须写明撤销原因；
  *   表里没有单独的取消原因列，原因落在 errorMsg；
+ * - 只有 FAILED 能由有权限的人重试（retry）：到顶（attemptCount>=maxAttempts）的不再入队，
+ *   重试只重新排队（回 PENDING、清失败说明/进度/起止时刻，attemptCount 不动），不新增执行记录；
  * - 任务编号 jobNo 形如 TJ-2026-0001，由仓储按年顺序分配（应用层不给编号）。
  */
 @Getter
@@ -174,6 +176,35 @@ public class TranscodeJob extends BaseEntity {
         if (status != JobStatus.RUNNING) {
             throw new BizException("只有处理中（RUNNING）的任务才能上报结果，当前状态：" + status);
         }
+    }
+
+    /**
+     * 领域行为：有权限的人在任务详情上点重试，把失败任务重新放回队列。
+     *
+     * - 只有 FAILED（跑失败了）能重试；还压在队列里等领的（PENDING）、正在跑的（RUNNING）、
+     *   已成功的（SUCCESS）、已撤销的（CANCELLED）都不放行（已删除的任务在仓储层查不到，进不来）；
+     * - 最多尝试次数建任务时就定死（maxAttempts），已跑次数（attemptCount）到顶的直接挡回、
+     *   不放进队列，免得到顶的单子没完没了占着位置；
+     * - 重试只是重新排队：状态回 PENDING，清掉上回的失败说明、进度归零、起止时刻清空；
+     *   已跑次数留着不动（下次被领走 attemptCount 接着 +1），提交时刻也不动。
+     *   这一步不新增执行记录 —— 等节点真把它领走、再次跑起来才接着记，
+     *   执行序号 attemptNo 接着上一次往下排，而不是回到第一次那个号。
+     *
+     * 注意：这里只校验「当前看到的状态」；同一条任务被连点几下、或几个人同时点，
+     * 由仓储的条件更新（WHERE status=FAILED）兜底，只排一次（见 requeueIfFailed）。
+     */
+    public void retry() {
+        if (status != JobStatus.FAILED) {
+            throw new BizException("只有失败（FAILED）的任务才能重试，当前状态：" + status);
+        }
+        if (attemptCount >= maxAttempts) {
+            throw new BizException("任务已达到最多尝试次数（" + maxAttempts + " 次），不能再重试");
+        }
+        this.status = JobStatus.PENDING;
+        this.progress = 0;
+        this.errorMsg = null;
+        this.startedAt = null;
+        this.finishedAt = null;
     }
 
     /**
